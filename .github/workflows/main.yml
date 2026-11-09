@@ -255,17 +255,60 @@ jobs:
               "$pages_link"
           fi
 
-          mapfile -d '' local_assets < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
-          gh release create "$RELEASE_TAG" "${local_assets[@]}" \
+          # =========================================================================
+          # 修改核心：先创建 Release（不带附件），然后循环上传附件，并过滤空文件
+          # =========================================================================
+          
+          echo "Creating release $RELEASE_TAG..."
+          gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$SOURCE_SHA" \
             --title "$release_title" \
             --notes "$release_notes" \
             --prerelease
 
-          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/local-assets.txt
+          echo "Uploading assets to release $RELEASE_TAG..."
+          if [[ -d "release-assets" ]]; then
+            for file in release-assets/*; do
+              if [[ -f "$file" ]]; then
+                # 检查文件大小，跳过 0 字节文件以避免 Bad Content-Length 错误
+                if [[ ! -s "$file" ]]; then
+                  echo "::warning::Skipping empty file: $file (prevents HTTP 400 Bad Content-Length)"
+                  continue
+                fi
+                
+                echo "Uploading $file..."
+                # 使用 --clobber 以防之前有同名文件冲突，使用 || 防止单个文件失败导致中断
+                gh release upload "$RELEASE_TAG" "$file" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --clobber || { 
+                    echo "::error::Failed to upload $file"; 
+                    exit 1; 
+                  }
+              fi
+            done
+          else
+            echo "::warning::release-assets directory not found."
+          fi
+
+          # =========================================================================
+          
+          # 验证上传结果
+          echo "Verifying uploaded assets..."
+          # 注意：这里找的是非空文件，以匹配实际上传的列表
+          find release-assets -maxdepth 1 -type f -size +0c -printf '%f\n' | sort > /tmp/local-assets.txt
           gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets \
             --jq '.assets[].name' | sort > /tmp/remote-assets.txt
-          diff -u /tmp/local-assets.txt /tmp/remote-assets.txt
+          
+          echo "--- Remote assets ---"
+          cat /tmp/remote-assets.txt
+          
+          # 检查差异，如果上传完全成功，diff 不会有输出并返回 0
+          if ! diff -u /tmp/local-assets.txt /tmp/remote-assets.txt; then
+            echo "::error::Uploaded assets do not match local assets!"
+            exit 1
+          fi
+          
+          echo "Release published and verified successfully."
